@@ -231,11 +231,13 @@ def create_embeddings_batch(
     
     # Initialize lists to collect all processed data
     all_valid_chunks = []
-    all_valid_metadata = []
+    all_valid_metadata = []  # Full metadata for FAISS (includes tokens)
     all_valid_embeddings = []
+    all_metadata_for_json = []  # Lightweight metadata for JSON (no vectors/tokens)
     
     # Process chunks in batches with progress bar and incremental saving
     logger.info("Generating embeddings and building vector store in batches...")
+    logger.info("Optimization: Storing vectors in FAISS only, keeping metadata.json lightweight")
     with tqdm(total=total_chunks, desc="Processing embeddings", unit="chunks") as pbar:
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
@@ -250,34 +252,42 @@ def create_embeddings_batch(
                 
                 # Add vectors to metadata and collect valid entries
                 batch_valid_chunks = []
-                batch_valid_metadata = []
+                batch_valid_metadata = []  # For FAISS (includes tokens)
                 batch_valid_embeddings = []
+                batch_metadata_for_json = []  # Lightweight for JSON
                 
                 for i, (chunk, meta, emb) in enumerate(zip(batch_chunks, batch_metadata, batch_embeddings)):
                     if emb is not None:
-                        # Add vector to metadata (convert numpy array to list for JSON)
-                        meta_with_vector = meta.copy()
-                        meta_with_vector["vector"] = emb.tolist() if isinstance(emb, np.ndarray) else list(emb)
+                        # Full metadata for FAISS (includes tokens for reference)
+                        meta_for_faiss = meta.copy()
+                        
+                        # Lightweight metadata for JSON (vectors stored in FAISS, not needed here)
+                        # This reduces metadata.json size by ~99% (no 768-dim vectors per entry)
+                        meta_for_json = {
+                            "source": meta.get("source"),
+                            "chunk_index": meta.get("chunk_index"),
+                            "total_chunks": meta.get("total_chunks")
+                            # Excluded: tokens (large), vector (redundant - in FAISS)
+                        }
                         
                         batch_valid_chunks.append(chunk)
-                        batch_valid_metadata.append(meta_with_vector)
+                        batch_valid_metadata.append(meta_for_faiss)  # Full for FAISS
                         batch_valid_embeddings.append(emb)
+                        batch_metadata_for_json.append(meta_for_json)  # Lightweight for JSON
                 
                 if not batch_valid_chunks:
                     logger.warning(f"No valid embeddings in batch {batch_idx + 1}/{num_batches}")
                     pbar.update(len(batch_chunks))
                     continue
                 
-                # Save metadata incrementally after each batch
-                save_metadata_incremental(output_dir, batch_valid_metadata)
+                # Save lightweight metadata incrementally (without vectors/tokens)
+                save_metadata_incremental(output_dir, batch_metadata_for_json)
                 
-                # Collect data for FAISS (will build at the end to avoid regenerating embeddings)
-                # Metadata is saved incrementally above, FAISS will be built once at the end
-                
-                # Collect for final return
+                # Collect for final FAISS build
                 all_valid_chunks.extend(batch_valid_chunks)
                 all_valid_metadata.extend(batch_valid_metadata)
                 all_valid_embeddings.extend(batch_valid_embeddings)
+                all_metadata_for_json.extend(batch_metadata_for_json)
                 
                 pbar.update(len(batch_chunks))
                 
@@ -330,7 +340,8 @@ def create_embeddings_batch(
         )
     
     logger.info("Embedding generation completed")
-    return vectorstore, all_valid_metadata
+    logger.info(f"Metadata optimized: vectors stored in FAISS, lightweight metadata.json created")
+    return vectorstore, all_metadata_for_json
 
 
 def save_metadata_incremental(
@@ -338,11 +349,14 @@ def save_metadata_incremental(
     new_metadata: List[Dict[str, Any]]
 ) -> None:
     """
-    Save metadata incrementally by appending to existing metadata.json.
+    Save lightweight metadata incrementally by appending to existing metadata.json.
+    
+    Note: This saves only essential metadata (source, chunk_index, total_chunks).
+    Vectors are stored in FAISS, not in JSON, to optimize storage and performance.
     
     Args:
         output_dir: Directory containing metadata.json
-        new_metadata: New metadata entries to append
+        new_metadata: New lightweight metadata entries to append (without vectors/tokens)
     """
     # Create directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -379,26 +393,33 @@ def save_vectorstore(
 ) -> None:
     """
     Save FAISS vector store to disk.
-    Note: Metadata is already saved incrementally during batch processing.
+    
+    Note: 
+    - FAISS stores vectors and full document metadata (including tokens)
+    - metadata.json contains only lightweight tracking info (source, indices)
+    - This separation optimizes storage: vectors in FAISS (binary), metadata in JSON (small)
     
     Args:
-        vectorstore: FAISS vector store to save
+        vectorstore: FAISS vector store to save (contains vectors and full metadata)
         output_dir: Directory to save the vector store
-        metadata: List of metadata dictionaries (for logging/verification)
+        metadata: List of lightweight metadata dictionaries (for logging/verification)
     """
     # Create directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # Save FAISS index
+        # Save FAISS index (contains vectors and full document metadata)
         logger.info(f"Saving FAISS vector store to {output_dir}")
+        logger.info("FAISS stores: vectors, document texts, and full metadata (including tokens)")
         vectorstore.save_local(str(output_dir))
         logger.info("FAISS vector store saved successfully")
         
-        # Verify metadata file exists (it should have been saved incrementally)
+        # Verify lightweight metadata file exists (saved incrementally during processing)
         metadata_path = output_dir / "metadata.json"
         if metadata_path.exists():
-            logger.info(f"Metadata already saved incrementally ({len(metadata)} entries)")
+            file_size = metadata_path.stat().st_size / 1024  # Size in KB
+            logger.info(f"Lightweight metadata.json exists ({len(metadata)} entries, {file_size:.2f} KB)")
+            logger.info("Note: Vectors are stored in FAISS, not in metadata.json for optimal performance")
         else:
             logger.warning("Metadata file not found, saving now...")
             with open(metadata_path, 'w', encoding='utf-8') as f:
