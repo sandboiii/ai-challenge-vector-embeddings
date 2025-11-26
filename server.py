@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
 from pydantic import BaseModel, Field
+from sentence_transformers import CrossEncoder
 
 # Force CPU mode for Ollama to avoid GPU/ROCm issues
 os.environ.setdefault("OLLAMA_NUM_GPU", "0")
@@ -29,9 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables to store the vector store and embeddings
+# Global variables to store the vector store, embeddings, and reranker
 vectorstore: Optional[FAISS] = None
 embeddings: Optional[OllamaEmbeddings] = None
+reranker: Optional[CrossEncoder] = None
 
 
 # Pydantic models for request/response
@@ -51,9 +53,9 @@ class AugmentResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan context manager to load vector store and embeddings on startup.
+    Lifespan context manager to load vector store, embeddings, and reranker on startup.
     """
-    global vectorstore, embeddings
+    global vectorstore, embeddings, reranker
     
     vectorstore_path = Path("./vectorstore")
     
@@ -90,6 +92,15 @@ async def lifespan(app: FastAPI):
         logger.info(f"Vector store loaded successfully ({vectorstore.index.ntotal} vectors)")
     except Exception as e:
         logger.error(f"Failed to load vector store: {str(e)}")
+        raise
+    
+    # Initialize CrossEncoder reranker
+    logger.info("Initializing CrossEncoder reranker (model: cross-encoder/ms-marco-MiniLM-L-6-v2)...")
+    try:
+        reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        logger.info("CrossEncoder reranker initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize CrossEncoder reranker: {str(e)}")
         raise
     
     logger.info("=" * 50)
@@ -136,7 +147,8 @@ async def health_check():
     return {
         "status": "healthy",
         "vectorstore_loaded": vectorstore is not None,
-        "embeddings_loaded": embeddings is not None
+        "embeddings_loaded": embeddings is not None,
+        "reranker_loaded": reranker is not None
     }
 
 
@@ -145,10 +157,10 @@ async def augment_query(request: AugmentRequest):
     """
     Augment a user query with relevant context from the vector store.
     
-    This endpoint:
-    1. Converts the user query into an embedding
-    2. Searches the FAISS index for the top k most similar chunks
-    3. Constructs a suggested prompt combining the retrieved context and the query
+    This endpoint performs a two-stage retrieval process:
+    1. Initial Retrieval: Uses FAISS to fetch top 15 candidates with scores
+    2. Reranking: Uses CrossEncoder to rerank and select top k chunks
+    3. Returns the final top k chunks with detailed logging at each stage
     
     Args:
         request: AugmentRequest containing the query and optional k parameter
@@ -157,26 +169,62 @@ async def augment_query(request: AugmentRequest):
         AugmentResponse with original query, context chunks, and suggested prompt
         
     Raises:
-        HTTPException: 404 if vector store not loaded, 500 for internal errors
+        HTTPException: 503 if vector store/embeddings/reranker not loaded, 500 for internal errors
     """
-    if vectorstore is None or embeddings is None:
+    if vectorstore is None or embeddings is None or reranker is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Vector store or embeddings not loaded. Please check server logs."
+            detail="Vector store, embeddings, or reranker not loaded. Please check server logs."
         )
     
     try:
-        # Perform similarity search
-        logger.info(f"Searching for top {request.k} documents for query: {request.query[:50]}...")
+        query = request.query
+        k = request.k
         
-        # Use similarity_search_with_score to get results with relevance scores
-        results = vectorstore.similarity_search_with_score(
-            request.query,
-            k=request.k
+        # Step 1: Initial Retrieval (with scores)
+        logger.info(f"Searching for top 15 documents for query: {query[:50]}...")
+        
+        initial_results = vectorstore.similarity_search_with_score(
+            query,
+            k=15
         )
         
-        # Extract text chunks from results
-        context_chunks = [doc.page_content for doc, score in results]
+        # Log Stage 1: Before Reranking
+        logger.info("--- Stage 1: Initial Retrieval (Top 15 from FAISS) ---")
+        for i, (doc, faiss_score) in enumerate(initial_results, start=1):
+            metadata_source = doc.metadata.get('source', 'unknown')
+            text_preview = doc.page_content[:70] + "..." if len(doc.page_content) > 70 else doc.page_content
+            logger.info(f"[Rank {i}] Score: {faiss_score:.4f} | Source: {metadata_source} | Text: \"{text_preview}\"")
+        
+        # Step 2: Reranking
+        # Extract text from documents
+        chunk_texts = [doc.page_content for doc, _ in initial_results]
+        
+        # Prepare pairs for CrossEncoder: [query, chunk_text]
+        pairs = [[query, chunk_text] for chunk_text in chunk_texts]
+        
+        # Get reranker scores
+        reranker_scores = reranker.predict(pairs)
+        
+        # Step 3: Sorting & Slicing
+        # Combine documents with their reranker scores
+        ranked_results = list(zip(initial_results, reranker_scores))
+        
+        # Sort by reranker score (descending - higher is better)
+        ranked_results.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take top k chunks
+        final_results = ranked_results[:k]
+        
+        # Log Stage 2: After Reranking
+        logger.info(f"--- Stage 2: Reranked Results (Top {k} from Cross-Encoder) ---")
+        for i, ((doc, faiss_score), reranker_score) in enumerate(final_results, start=1):
+            metadata_source = doc.metadata.get('source', 'unknown')
+            text_preview = doc.page_content[:70] + "..." if len(doc.page_content) > 70 else doc.page_content
+            logger.info(f"[Rank {i}] Score: {reranker_score:.4f} | Source: {metadata_source} | Text: \"{text_preview}\"")
+        
+        # Step 4: Extract final context chunks
+        context_chunks = [doc.page_content for (doc, _), _ in final_results]
         
         # Construct suggested prompt
         context_text = "\n\n".join([
@@ -187,14 +235,14 @@ async def augment_query(request: AugmentRequest):
         suggested_prompt = f"""Context:
 {context_text}
 
-Question: {request.query}
+Question: {query}
 
 Please answer the question based on the provided context."""
         
-        logger.info(f"Retrieved {len(context_chunks)} context chunks")
+        logger.info(f"Retrieved {len(context_chunks)} context chunks after reranking")
         
         return AugmentResponse(
-            original_query=request.query,
+            original_query=query,
             context_chunks=context_chunks,
             suggested_prompt=suggested_prompt
         )
