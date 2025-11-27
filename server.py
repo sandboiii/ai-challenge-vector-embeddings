@@ -46,8 +46,7 @@ class AugmentRequest(BaseModel):
 class AugmentResponse(BaseModel):
     """Response model for the augment endpoint."""
     original_query: str = Field(..., description="The original user query")
-    context_chunks: List[str] = Field(..., description="Retrieved context chunks from the vector store")
-    suggested_prompt: str = Field(..., description="Augmented prompt combining context and query")
+    context_chunks: List[str] = Field(..., description="Retrieved context chunks with citations from the vector store")
 
 
 @asynccontextmanager
@@ -223,28 +222,31 @@ async def augment_query(request: AugmentRequest):
             text_preview = doc.page_content[:70] + "..." if len(doc.page_content) > 70 else doc.page_content
             logger.info(f"[Rank {i}] Score: {reranker_score:.4f} | Source: {metadata_source} | Text: \"{text_preview}\"")
         
-        # Step 4: Extract final context chunks
-        context_chunks = [doc.page_content for (doc, _), _ in final_results]
+        # Step 4: Format final context chunks with citations
+        context_chunks = []
         
-        # Construct suggested prompt
-        context_text = "\n\n".join([
-            f"[Context {i+1}]: {chunk}"
-            for i, chunk in enumerate(context_chunks)
-        ])
-        
-        suggested_prompt = f"""Context:
-{context_text}
-
-Question: {query}
-
-Please answer the question based on the provided context."""
+        for idx, ((doc, _), _) in enumerate(final_results, start=1):
+            chunk_text = doc.page_content
+            
+            # Extract and clean metadata
+            source_path = doc.metadata.get('source', 'unknown')
+            page_num = doc.metadata.get('page', 'N/A')
+            
+            # Clean filename: extract only the filename from full path
+            if source_path and source_path != 'unknown':
+                filename = os.path.basename(source_path)
+            else:
+                filename = 'unknown'
+            
+            # Format chunk with citation metadata
+            formatted_chunk = f"[Source {idx}] (File: {filename}, Page: {page_num}):\n{chunk_text}"
+            context_chunks.append(formatted_chunk)
         
         logger.info(f"Retrieved {len(context_chunks)} context chunks after reranking")
         
         return AugmentResponse(
             original_query=query,
-            context_chunks=context_chunks,
-            suggested_prompt=suggested_prompt
+            context_chunks=context_chunks
         )
         
     except Exception as e:

@@ -41,15 +41,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_pdfs(documents_dir: Path) -> List[Tuple[str, str]]:
+def load_pdfs(documents_dir: Path) -> List[Tuple[str, str, List[Tuple[int, int]]]]:
     """
-    Load all PDF files from the documents directory.
+    Load all PDF files from the documents directory with page boundary tracking.
     
     Args:
         documents_dir: Path to the directory containing PDF files
         
     Returns:
-        List of tuples containing (filename, text_content) for each PDF
+        List of tuples containing (filename, text_content, page_boundaries) for each PDF.
+        page_boundaries is a list of (start_char, page_num) tuples indicating where each page starts.
     """
     # Create directory if it doesn't exist
     documents_dir.mkdir(parents=True, exist_ok=True)
@@ -69,14 +70,22 @@ def load_pdfs(documents_dir: Path) -> List[Tuple[str, str]]:
             logger.info(f"Loading PDF: {pdf_file.name}")
             reader = PdfReader(str(pdf_file))
             
-            # Extract text from all pages
+            # Extract text from all pages with page boundary tracking
             text_content = ""
-            for page in reader.pages:
-                text_content += page.extract_text() + "\n"
+            page_boundaries = []  # List of (start_char, page_num) tuples
+            
+            for page_num, page in enumerate(reader.pages, start=1):
+                page_start = len(text_content)
+                page_text = page.extract_text() + "\n"
+                text_content += page_text
+                
+                # Track page boundary (start character position, page number)
+                # Track all pages, even empty ones, for accurate page mapping
+                page_boundaries.append((page_start, page_num))
             
             if text_content.strip():
-                texts.append((pdf_file.name, text_content))
-                logger.info(f"Successfully loaded {pdf_file.name} ({len(text_content)} characters)")
+                texts.append((pdf_file.name, text_content, page_boundaries))
+                logger.info(f"Successfully loaded {pdf_file.name} ({len(text_content)} characters, {len(page_boundaries)} pages)")
             else:
                 logger.warning(f"No text extracted from {pdf_file.name}")
                 
@@ -89,21 +98,21 @@ def load_pdfs(documents_dir: Path) -> List[Tuple[str, str]]:
 
 
 def chunk_documents(
-    texts: List[Tuple[str, str]], 
+    texts: List[Tuple[str, str, List[Tuple[int, int]]]], 
     chunk_size: int = 1000, 
     chunk_overlap: int = 100
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
-    Split documents into chunks based on token count.
+    Split documents into chunks based on token count, tracking page numbers.
     
     Args:
-        texts: List of (filename, text) tuples
+        texts: List of (filename, text, page_boundaries) tuples
         chunk_size: Maximum number of tokens per chunk
         chunk_overlap: Number of tokens to overlap between chunks
         
     Returns:
         Tuple of (chunks, metadata) where chunks is a list of text chunks
-        and metadata is a list of dictionaries with LangChain metadata format
+        and metadata is a list of dictionaries with LangChain metadata format including page numbers
     """
     if not texts:
         logger.warning("No texts provided for chunking")
@@ -125,14 +134,34 @@ def chunk_documents(
     all_chunks = []
     all_metadata = []
     
-    for filename, text in texts:
+    for filename, text, page_boundaries in texts:
         try:
             # Split the text into chunks
             chunks = text_splitter.split_text(text)
             
-            # Create metadata for each chunk with tokenized text
-            for i, chunk in enumerate(chunks):
+            # Find character positions of each chunk in the original text
+            chunk_positions = []
+            current_pos = 0
+            for chunk in chunks:
+                chunk_start = text.find(chunk, current_pos)
+                if chunk_start == -1:
+                    # Fallback: use current position if exact match not found
+                    chunk_start = current_pos
+                chunk_end = chunk_start + len(chunk)
+                chunk_positions.append((chunk_start, chunk_end))
+                current_pos = chunk_start + 1  # Move forward to avoid finding same chunk
+            
+            # Create metadata for each chunk with tokenized text and page number
+            for i, (chunk, (chunk_start, chunk_end)) in enumerate(zip(chunks, chunk_positions)):
                 all_chunks.append(chunk)
+                
+                # Determine which page this chunk belongs to
+                page_num = 1  # Default to page 1
+                for page_start, page_number in page_boundaries:
+                    if chunk_start >= page_start:
+                        page_num = page_number
+                    else:
+                        break  # Since boundaries are sorted, we can break early
                 
                 # Tokenize the chunk text and get actual token strings
                 try:
@@ -171,6 +200,7 @@ def chunk_documents(
                     "source": filename,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
+                    "page": page_num,
                     "tokens": token_list
                 })
             
@@ -266,7 +296,8 @@ def create_embeddings_batch(
                         meta_for_json = {
                             "source": meta.get("source"),
                             "chunk_index": meta.get("chunk_index"),
-                            "total_chunks": meta.get("total_chunks")
+                            "total_chunks": meta.get("total_chunks"),
+                            "page": meta.get("page", 1)
                             # Excluded: tokens (large), vector (redundant - in FAISS)
                         }
                         
